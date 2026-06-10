@@ -585,8 +585,12 @@
   'use strict';
 
   /* ============ STATE ============ */
-  let tts = null;
+  let tts = null;                // truthy once the worker reports the engine is ready
   let engineState = 'idle';      // idle | loading | ready | error
+  let engineDevice = 'wasm';
+  let enginePromise = null;
+  let engineResolve = null;
+  let engineReject = null;
   let sentences = [];
   let chapters = [];
   let currentIndex = 0;
@@ -595,8 +599,8 @@
   let genToken = 0;              // bumped on voice change / new book
   let tocOpenDesktop = true;
 
-  const PREFETCH = 6;            // sentences to generate ahead
-  const CACHE_MAX = 80;          // max cached audio clips
+  const PREFETCH = 8;            // sentences to generate ahead
+  const CACHE_MAX = 50;          // max cached audio clips
 
   const audioCache = new Map();  // idx -> object URL
   const failedGen = new Set();   // sentences that failed generation — skip, don't retry forever
@@ -665,7 +669,7 @@
   const player = new Audio();
   player.preload = 'auto';
 
-  /* ============ PREFERENCES (localStorage — fine on own hosting) ============ */
+  /* ============ PREFERENCES ============ */
   function prefGet(key) {
     try { return localStorage.getItem(key); } catch (e) { return null; }
   }
@@ -673,6 +677,14 @@
     try { localStorage.setItem(key, value); } catch (e) {}
   }
   function sanitizeKey(s) { return s.replace(/[\s\/\\'"]/g, '_').slice(0, 160); }
+
+  /* ============ UI STATUS HELPERS ============ */
+  function setBusy(busy) {
+    el.playBtn.classList.toggle('busy', busy);
+  }
+  function setGenStatus(msg) {
+    el.genStatus.textContent = msg || '';
+  }
 
   /* ============ VOICE SELECT ============ */
   el.voiceSelect.innerHTML = '';
@@ -690,9 +702,9 @@
 
   el.voiceSelect.addEventListener('change', () => {
     prefSet('lr_voice', el.voiceSelect.value);
-    // New voice — old audio is wrong. Clear cache and regenerate.
     invalidateAudio();
     if (isPlaying) playIndex(currentIndex);
+    else kickGenLoop();
   });
 
   el.rateSelect.addEventListener('change', () => {
@@ -707,7 +719,125 @@
     audioCache.clear();
   }
 
+  /* ============ TTS WORKER ============ */
+  /* All ML inference runs in a Web Worker so the page never freezes.
+     The worker loads Kokoro, prefers WebGPU, and falls back to WASM. */
+  const WORKER_SRC = [
+    "let tts = null;",
+    "let loadPromise = null;",
+    "",
+    "function reportProgress(p) {",
+    "  if (p && p.status === 'progress') {",
+    "    self.postMessage({ type: 'progress', file: p.file, loaded: p.loaded || 0, total: p.total || 0 });",
+    "  }",
+    "}",
+    "",
+    "async function doLoad(opts) {",
+    "  const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');",
+    "  let device = opts.device;",
+    "  let dtype = opts.dtype;",
+    "  try {",
+    "    tts = await mod.KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {",
+    "      device: device, dtype: dtype, progress_callback: reportProgress",
+    "    });",
+    "  } catch (err) {",
+    "    if (device === 'webgpu') {",
+    "      self.postMessage({ type: 'fallback', message: (err && err.message) || String(err) });",
+    "      device = 'wasm';",
+    "      dtype = 'q8';",
+    "      tts = await mod.KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {",
+    "        device: device, dtype: dtype, progress_callback: reportProgress",
+    "      });",
+    "    } else {",
+    "      throw err;",
+    "    }",
+    "  }",
+    "  self.postMessage({ type: 'ready', device: device });",
+    "}",
+    "",
+    "self.onmessage = async (e) => {",
+    "  const msg = e.data;",
+    "  try {",
+    "    if (msg.type === 'load') {",
+    "      if (!loadPromise) loadPromise = doLoad(msg);",
+    "      await loadPromise;",
+    "    } else if (msg.type === 'generate') {",
+    "      if (!tts) throw new Error('Engine not loaded');",
+    "      const raw = await tts.generate(msg.text, { voice: msg.voice });",
+    "      const buf = raw.audio.buffer;",
+    "      self.postMessage({ type: 'result', id: msg.id, sr: raw.sampling_rate || 24000, audio: buf }, [buf]);",
+    "    }",
+    "  } catch (err) {",
+    "    self.postMessage({ type: 'error', id: msg.id, message: (err && err.message) || String(err) });",
+    "  }",
+    "};"
+  ].join('\n');
+
+  let worker = null;
+  let genId = 0;
+  const pendingGen = new Map();
+
+  function ensureWorker() {
+    if (worker) return worker;
+    const blob = new Blob([WORKER_SRC], { type: 'text/javascript' });
+    worker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'progress') {
+        onEngineProgress(m);
+      } else if (m.type === 'fallback') {
+        el.engineMsg.textContent = 'GPU unavailable \u2014 switching to CPU (smaller download)\u2026';
+        fileProgress = {};
+      } else if (m.type === 'ready') {
+        tts = true;
+        engineDevice = m.device;
+        if (engineResolve) { engineResolve(); engineResolve = null; engineReject = null; }
+      } else if (m.type === 'result') {
+        const p = pendingGen.get(m.id);
+        if (p) {
+          pendingGen.delete(m.id);
+          p.resolve({ audio: new Float32Array(m.audio), sr: m.sr });
+        }
+      } else if (m.type === 'error') {
+        if (m.id != null && pendingGen.has(m.id)) {
+          const p = pendingGen.get(m.id);
+          pendingGen.delete(m.id);
+          p.reject(new Error(m.message));
+        } else if (engineReject) {
+          const r = engineReject;
+          engineReject = null; engineResolve = null;
+          r(new Error(m.message));
+        } else {
+          setGenStatus('Engine error: ' + m.message);
+        }
+      }
+    };
+
+    worker.onerror = (e) => {
+      const msg = (e && e.message) || 'Voice worker failed';
+      if (engineReject) {
+        const r = engineReject;
+        engineReject = null; engineResolve = null;
+        r(new Error(msg));
+      }
+      setGenStatus('Error: ' + msg);
+    };
+
+    return worker;
+  }
+
+  function workerGenerate(text, voice) {
+    return new Promise((resolve, reject) => {
+      const id = ++genId;
+      pendingGen.set(id, { resolve, reject });
+      ensureWorker().postMessage({ type: 'generate', id, text, voice });
+    });
+  }
+
   /* ============ ENGINE LOADING ============ */
+  let fileProgress = {};
+
   function setEngine(state, msg) {
     engineState = state;
     el.engineBar.className = 'engine-bar show ' + state;
@@ -715,47 +845,44 @@
     el.engineLoadBtn.style.display = (state === 'idle' || state === 'error') ? '' : 'none';
   }
 
+  function onEngineProgress(m) {
+    if (!m.total) return;
+    fileProgress[m.file] = { loaded: m.loaded, total: m.total };
+    let loaded = 0, total = 0;
+    for (const f of Object.values(fileProgress)) { loaded += f.loaded; total += f.total; }
+    if (total > 0) {
+      const pct = Math.min(100, (loaded / total) * 100);
+      el.engineProgressFill.style.width = pct + '%';
+      el.engineMsg.textContent =
+        'Downloading voice engine\u2026 ' +
+        (loaded / 1048576).toFixed(0) + ' / ' + (total / 1048576).toFixed(0) + ' MB';
+    }
+  }
+
   async function loadEngine() {
-    if (tts || engineState === 'loading') return tts;
+    if (tts) return;
+    if (engineState === 'loading' && enginePromise) return enginePromise;
 
-    const useWebGPU = !!navigator.gpu && !isMobile();
-    const device = useWebGPU ? 'webgpu' : 'wasm';
-    const dtype = useWebGPU ? 'fp32' : 'q8';
-    const sizeHint = useWebGPU ? '~330 MB' : '~90 MB';
+    const wantGPU = !!navigator.gpu;
+    const device = wantGPU ? 'webgpu' : 'wasm';
+    const dtype = wantGPU ? 'fp32' : 'q8';
+    const sizeHint = wantGPU ? '~330 MB' : '~90 MB';
 
-    setEngine('loading', `Downloading voice engine (${sizeHint}, one-time)\u2026`);
+    fileProgress = {};
+    setEngine('loading', 'Downloading voice engine (' + sizeHint + ', one-time)\u2026');
 
-    const fileProgress = {};
-    const onProgress = (p) => {
-      if (p.status === 'progress' && p.total) {
-        fileProgress[p.file] = { loaded: p.loaded || 0, total: p.total || 0 };
-        let loaded = 0, total = 0;
-        for (const f of Object.values(fileProgress)) { loaded += f.loaded; total += f.total; }
-        if (total > 0) {
-          const pct = Math.min(100, (loaded / total) * 100);
-          el.engineProgressFill.style.width = pct + '%';
-          el.engineMsg.textContent =
-            `Downloading voice engine\u2026 ${(loaded / 1048576).toFixed(0)} / ${(total / 1048576).toFixed(0)} MB`;
-        }
-      }
-    };
+    enginePromise = new Promise((res, rej) => { engineResolve = res; engineReject = rej; });
+    ensureWorker().postMessage({ type: 'load', device, dtype });
 
     try {
-      const { KokoroTTS } = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
-      tts = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
-        dtype, device,
-        progress_callback: onProgress,
-      });
-      setEngine('ready', `Neural voice ready \u00b7 ${useWebGPU ? 'GPU' : 'CPU'}`);
+      await enginePromise;
+      setEngine('ready', 'Neural voice ready \u00b7 ' + (engineDevice === 'webgpu' ? 'GPU' : 'CPU'));
       prefSet('lr_engine_loaded', '1');
-      // Fade the bar out after a moment
       setTimeout(() => {
         if (engineState === 'ready') el.engineBar.classList.remove('show');
       }, 4000);
-      return tts;
+      kickGenLoop();
     } catch (err) {
-      console.error('Engine load failed:', err);
-      tts = null;
       const detail = (err && err.message) ? err.message : String(err);
       setEngine('error', 'Voice engine failed: ' + detail);
       throw err;
@@ -764,20 +891,12 @@
 
   el.engineLoadBtn.addEventListener('click', () => loadEngine().catch(() => {}));
 
-  // Show the bar on first visit; auto-load silently if they've loaded before
   setEngine('idle', 'Neural voice not loaded \u2014 one-time download required');
   if (prefGet('lr_engine_loaded') === '1') {
     loadEngine().catch(() => {});
   }
 
-  /* ============ WAV ENCODING FALLBACK ============ */
-  function rawToWavBlob(raw) {
-    if (typeof raw.toBlob === 'function') {
-      try { return raw.toBlob(); } catch (e) { /* fall through */ }
-    }
-    return encodeWav(raw.audio, raw.sampling_rate || 24000);
-  }
-
+  /* ============ WAV ENCODING ============ */
   function encodeWav(float32, sampleRate) {
     const len = float32.length;
     const buffer = new ArrayBuffer(44 + len * 2);
@@ -806,9 +925,9 @@
   }
 
   /* ============ AUDIO GENERATION PIPELINE ============ */
-  // A single worker loop that always generates the most-needed sentence:
+  // A single dispatcher that always generates the most-needed sentence:
   // the first uncached index in [currentIndex, currentIndex + PREFETCH].
-  // Jumping ahead instantly reprioritizes — no waiting behind stale queue items.
+  // Inference happens in the worker, so this never blocks the page.
   function kickGenLoop() {
     if (genBusy || !tts) return;
     const token = genToken;
@@ -825,9 +944,9 @@
           const text = sentences[next];
           if (!text || !text.trim()) { failedGen.add(next); continue; }
           try {
-            const raw = await tts.generate(text, { voice: el.voiceSelect.value });
+            const out = await workerGenerate(text, el.voiceSelect.value);
             if (token !== genToken) break;
-            audioCache.set(next, URL.createObjectURL(rawToWavBlob(raw)));
+            audioCache.set(next, URL.createObjectURL(encodeWav(out.audio, out.sr)));
             pruneCache();
           } catch (err) {
             console.warn('Generation failed for sentence', next, err);
@@ -855,21 +974,13 @@
   async function getAudio(idx) {
     const token = genToken;
     while (token === genToken && !audioCache.has(idx) && !failedGen.has(idx)) {
-      kickGenLoop(); // self-healing: re-kick in case the loop exited on a token bump
-      await sleep(150);
+      kickGenLoop(); // self-healing: re-kick if the loop exited on a token bump
+      await sleep(120);
     }
     return audioCache.get(idx) || null;
   }
 
   /* ============ PLAYBACK ============ */
-  function setBusy(busy) {
-    el.playBtn.classList.toggle('busy', busy);
-  }
-
-  function setGenStatus(msg) {
-    el.genStatus.textContent = msg || '';
-  }
-
   /* Unlock the audio element inside the user's tap, before any async work.
      iOS permits later programmatic play() on an element that has already
      played once via gesture. Without this, sentence 2 onward gets blocked. */
@@ -889,7 +1000,7 @@
   async function playIndex(idx) {
     if (idx >= sentences.length) { pause(); return; }
     if (idx < 0) idx = 0;
-    activePlayIdx = null; // nothing legitimate is playing during the transition
+    activePlayIdx = null;
     currentIndex = idx;
     highlightSentence(idx, true);
     updateProgress();
@@ -912,14 +1023,21 @@
     if (!url) {
       if (failedGen.has(idx)) { playIndex(idx + 1); return; }
       setBusy(true);
-      setGenStatus('Generating\u2026');
+      setGenStatus('Buffering\u2026');
+      const t0 = Date.now();
       url = await getAudio(idx);
+      // On slow (CPU) devices, buffer one extra clip so pauses are less frequent.
+      // Skip if generation was fast — no point delaying start on a quick device.
+      if (url && Date.now() - t0 > 1500 &&
+          idx + 1 < sentences.length &&
+          !audioCache.has(idx + 1) && !failedGen.has(idx + 1)) {
+        await getAudio(idx + 1);
+      }
       setGenStatus('');
       setBusy(false);
       if (token !== genToken || !isPlaying || currentIndex !== idx) return;
     }
     if (!url) {
-      // Generation failed for this sentence — skip it rather than dying
       setGenStatus('Skipped one line (generation failed).');
       playIndex(idx + 1);
       return;
@@ -965,7 +1083,6 @@
     el.playIcon.style.display = 'none';
     el.pauseIcon.style.display = 'block';
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-    // Resume mid-sentence if we have a paused real clip for this index
     if (activePlayIdx === currentIndex && player.src && player.paused &&
         !player.ended && player.currentTime > 0) {
       player.play().catch(() => playIndex(currentIndex));
@@ -986,6 +1103,7 @@
 
   function stopPlayback() {
     pause();
+    activePlayIdx = null;
     player.removeAttribute('src');
     player.load();
   }
@@ -1013,6 +1131,7 @@
       highlightSentence(idx, true);
       updateProgress();
       savePosition();
+      kickGenLoop();
     }
   }
 
