@@ -6,7 +6,7 @@
 <title>Listening Room</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&display=swap" rel="stylesheet" crossorigin="anonymous">
 <style>
   :root {
     --paper:       #f1e8d3;
@@ -579,7 +579,7 @@
 
 <input type="file" id="file-input" accept=".docx,.txt,.md" />
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js" crossorigin="anonymous"></script>
 <script type="module">
 (function() {
   'use strict';
@@ -863,7 +863,12 @@
     if (tts) return;
     if (engineState === 'loading' && enginePromise) return enginePromise;
 
-    const wantGPU = !!navigator.gpu;
+    // WebKit (all iPhone/iPad browsers, including Chrome on iOS) kills tabs
+    // that try to hold the 330MB fp32 model in memory. Apple mobile devices
+    // always get the small q8 model on CPU — multithreaded WASM keeps it fast.
+    const isAppleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const wantGPU = !!navigator.gpu && !isAppleMobile;
     const device = wantGPU ? 'webgpu' : 'wasm';
     const dtype = wantGPU ? 'fp32' : 'q8';
     const sizeHint = wantGPU ? '~330 MB' : '~90 MB';
@@ -876,7 +881,10 @@
 
     try {
       await enginePromise;
-      setEngine('ready', 'Neural voice ready \u00b7 ' + (engineDevice === 'webgpu' ? 'GPU' : 'CPU'));
+      const mode = engineDevice === 'webgpu'
+        ? 'GPU'
+        : (self.crossOriginIsolated ? 'CPU multi-thread' : 'CPU single-thread');
+      setEngine('ready', 'Neural voice ready \u00b7 ' + mode);
       prefSet('lr_engine_loaded', '1');
       setTimeout(() => {
         if (engineState === 'ready') el.engineBar.classList.remove('show');
