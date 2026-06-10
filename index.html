@@ -581,8 +581,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <script type="module">
-import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
-
 (function() {
   'use strict';
 
@@ -595,13 +593,18 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
   let isPlaying = false;
   let bookKey = null;
   let genToken = 0;              // bumped on voice change / new book
-  let genChain = Promise.resolve();
   let tocOpenDesktop = true;
 
   const PREFETCH = 6;            // sentences to generate ahead
   const CACHE_MAX = 80;          // max cached audio clips
 
   const audioCache = new Map();  // idx -> object URL
+  const failedGen = new Set();   // sentences that failed generation — skip, don't retry forever
+  let genBusy = false;
+  let audioUnlocked = false;
+  let silentURL = null;
+  let activePlayIdx = null;      // guards 'ended' so the unlock clip can't advance playback
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   const isMobile = () => window.matchMedia('(max-width: 820px)').matches;
 
@@ -699,7 +702,7 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
 
   function invalidateAudio() {
     genToken++;
-    genChain = Promise.resolve();
+    failedGen.clear();
     for (const url of audioCache.values()) URL.revokeObjectURL(url);
     audioCache.clear();
   }
@@ -738,6 +741,7 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
     };
 
     try {
+      const { KokoroTTS } = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
       tts = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
         dtype, device,
         progress_callback: onProgress,
@@ -752,7 +756,8 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
     } catch (err) {
       console.error('Engine load failed:', err);
       tts = null;
-      setEngine('error', 'Voice engine failed to load \u2014 check connection and retry.');
+      const detail = (err && err.message) ? err.message : String(err);
+      setEngine('error', 'Voice engine failed: ' + detail);
       throw err;
     }
   }
@@ -801,23 +806,39 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
   }
 
   /* ============ AUDIO GENERATION PIPELINE ============ */
-  function queueGenerate(idx, token) {
-    genChain = genChain.then(async () => {
-      if (token !== genToken) return;
-      if (idx < 0 || idx >= sentences.length) return;
-      if (audioCache.has(idx)) return;
-      if (!tts) return;
-      const text = sentences[idx];
-      if (!text || !text.trim()) return;
-      const raw = await tts.generate(text, { voice: el.voiceSelect.value });
-      if (token !== genToken) return;
-      const blob = rawToWavBlob(raw);
-      audioCache.set(idx, URL.createObjectURL(blob));
-      pruneCache();
-    }).catch(err => {
-      console.warn('Generation failed for sentence', idx, err);
-    });
-    return genChain;
+  // A single worker loop that always generates the most-needed sentence:
+  // the first uncached index in [currentIndex, currentIndex + PREFETCH].
+  // Jumping ahead instantly reprioritizes — no waiting behind stale queue items.
+  function kickGenLoop() {
+    if (genBusy || !tts) return;
+    const token = genToken;
+    genBusy = true;
+    (async () => {
+      try {
+        while (token === genToken && tts && sentences.length > 0) {
+          let next = -1;
+          const end = Math.min(currentIndex + PREFETCH, sentences.length - 1);
+          for (let i = currentIndex; i <= end; i++) {
+            if (!audioCache.has(i) && !failedGen.has(i)) { next = i; break; }
+          }
+          if (next === -1) break; // buffer is full
+          const text = sentences[next];
+          if (!text || !text.trim()) { failedGen.add(next); continue; }
+          try {
+            const raw = await tts.generate(text, { voice: el.voiceSelect.value });
+            if (token !== genToken) break;
+            audioCache.set(next, URL.createObjectURL(rawToWavBlob(raw)));
+            pruneCache();
+          } catch (err) {
+            console.warn('Generation failed for sentence', next, err);
+            if (token !== genToken) break;
+            failedGen.add(next);
+          }
+        }
+      } finally {
+        genBusy = false;
+      }
+    })();
   }
 
   function pruneCache() {
@@ -832,16 +853,12 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
   }
 
   async function getAudio(idx) {
-    if (!audioCache.has(idx)) {
-      await queueGenerate(idx, genToken);
+    const token = genToken;
+    while (token === genToken && !audioCache.has(idx) && !failedGen.has(idx)) {
+      kickGenLoop(); // self-healing: re-kick in case the loop exited on a token bump
+      await sleep(150);
     }
     return audioCache.get(idx) || null;
-  }
-
-  function prefetch(fromIdx) {
-    for (let i = fromIdx; i <= Math.min(fromIdx + PREFETCH, sentences.length - 1); i++) {
-      queueGenerate(i, genToken);
-    }
   }
 
   /* ============ PLAYBACK ============ */
@@ -853,9 +870,26 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
     el.genStatus.textContent = msg || '';
   }
 
+  /* Unlock the audio element inside the user's tap, before any async work.
+     iOS permits later programmatic play() on an element that has already
+     played once via gesture. Without this, sentence 2 onward gets blocked. */
+  function unlockAudio() {
+    if (audioUnlocked) return;
+    try {
+      if (!silentURL) {
+        silentURL = URL.createObjectURL(encodeWav(new Float32Array(1200), 24000));
+      }
+      player.src = silentURL;
+      const p = player.play();
+      if (p && p.catch) p.catch(() => {});
+      audioUnlocked = true;
+    } catch (e) {}
+  }
+
   async function playIndex(idx) {
     if (idx >= sentences.length) { pause(); return; }
     if (idx < 0) idx = 0;
+    activePlayIdx = null; // nothing legitimate is playing during the transition
     currentIndex = idx;
     highlightSentence(idx, true);
     updateProgress();
@@ -871,9 +905,12 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
       }
     }
 
+    kickGenLoop();
+
     const token = genToken;
     let url = audioCache.get(idx);
     if (!url) {
+      if (failedGen.has(idx)) { playIndex(idx + 1); return; }
       setBusy(true);
       setGenStatus('Generating\u2026');
       url = await getAudio(idx);
@@ -883,6 +920,7 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
     }
     if (!url) {
       // Generation failed for this sentence — skip it rather than dying
+      setGenStatus('Skipped one line (generation failed).');
       playIndex(idx + 1);
       return;
     }
@@ -891,19 +929,25 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
     player.playbackRate = parseFloat(el.rateSelect.value) || 1;
     try {
       await player.play();
+      activePlayIdx = idx;
     } catch (err) {
       console.warn('play() blocked:', err);
+      setGenStatus('Playback blocked \u2014 tap play again.');
       pause();
       return;
     }
     savePosition();
-    prefetch(idx + 1);
+    kickGenLoop();
   }
 
   player.addEventListener('ended', () => {
+    if (activePlayIdx === null) return; // ignore the unlock clip
+    activePlayIdx = null;
     if (isPlaying) playIndex(currentIndex + 1);
   });
   player.addEventListener('error', () => {
+    if (activePlayIdx === null) return;
+    activePlayIdx = null;
     if (isPlaying) playIndex(currentIndex + 1);
   });
 
@@ -916,12 +960,14 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
   function play() {
     if (sentences.length === 0) return;
     if (currentIndex >= sentences.length) currentIndex = 0;
+    unlockAudio(); // must happen synchronously inside the tap, before any await
     isPlaying = true;
     el.playIcon.style.display = 'none';
     el.pauseIcon.style.display = 'block';
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-    // Resume mid-sentence if we have a paused src for this index
-    if (player.src && player.paused && !player.ended && player.currentTime > 0) {
+    // Resume mid-sentence if we have a paused real clip for this index
+    if (activePlayIdx === currentIndex && player.src && player.paused &&
+        !player.ended && player.currentTime > 0) {
       player.play().catch(() => playIndex(currentIndex));
     } else {
       playIndex(currentIndex);
@@ -1075,7 +1121,7 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
     enableControls();
     updateMediaSession();
     // Start warming the buffer if engine is already up
-    if (tts) prefetch(currentIndex);
+    if (tts) kickGenLoop();
   }
 
   /* ============ PARSING ============ */
@@ -1309,6 +1355,15 @@ import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm";
 
   window.addEventListener('beforeunload', () => {
     try { player.pause(); } catch (e) {}
+  });
+
+  /* Surface unexpected failures on screen — phones don't have a console */
+  window.addEventListener('error', (e) => {
+    setGenStatus('Error: ' + (e.message || 'unknown'));
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason;
+    setGenStatus('Error: ' + ((r && r.message) || r || 'unknown'));
   });
 
 })();
